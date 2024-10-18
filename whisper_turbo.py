@@ -13,9 +13,6 @@ import tiktoken
 from huggingface_hub import snapshot_download, hf_hub_download
 import librosa
 
-SAMPLE_RATE = 16000
-N_SAMPLES = 480000
-N_FRAMES = 3000
 N_FFT = 400
 
 class Tokenizer:
@@ -38,9 +35,9 @@ class Tokenizer:
             lol = [lol]
         return [self.encoding.decode(l) for l in lol]
 
-def load_audio(file: str, sr: int = SAMPLE_RATE):
+def load_audio(file, sr=16000):
     try:
-        out = run(f"ffmpeg -nostdin -threads 0 -i {file} -f s16le -ac 1 -acodec pcm_s16le -ar {sr} -", shell=True, capture_output=True, check=True).stdout
+        out = run(["ffmpeg", "-nostdin", "-threads", "0", "-i", file, "-f", "s16le", "-ac", "1", "-acodec", "pcm_s16le", "-ar", str(sr), "-"], capture_output=True, check=True).stdout
     except CalledProcessError as e:
         raise RuntimeError(f"Failed to load audio: {e.stderr.decode()}") from e
     return mx.array(np.frombuffer(out, np.int16)).flatten().astype(mx.float32) / 32768.0
@@ -56,7 +53,7 @@ def mel_filters(n_mels):
 def hanning():
     return mx.array(np.hanning(N_FFT + 1)[:-1])
 
-def stft(x, window, nperseg=256, noverlap=None, nfft=None, axis=-1, pad_mode="reflect"):
+def stft(x, window, nperseg=400, noverlap=160, nfft=None, axis=-1, pad_mode="reflect"):
     if nfft is None:
         nfft = nperseg
     if noverlap is None:
@@ -78,7 +75,7 @@ def stft(x, window, nperseg=256, noverlap=None, nfft=None, axis=-1, pad_mode="re
     x = mx.as_strided(x, shape=shape, strides=strides)
     return mx.fft.rfft(x * window)
 
-def log_mel_spectrogram(audio, n_mels, padding):
+def log_mel_spectrogram(audio, n_mels=128, padding=480000):
     if isinstance(audio, str):
         audio = load_audio(audio)
     elif not isinstance(audio, mx.array):
@@ -214,27 +211,48 @@ class Transcriber(nn.Module):
     def __init__(self, cfg):
         self.model = Whisper(cfg)
         self.tokenizer = Tokenizer()
-    def __call__(self, path_audio, any_lang):
-        mel = log_mel_spectrogram(path_audio, n_mels=128, padding=N_SAMPLES)
-        mel = self.model.encode(mel[:N_FRAMES][None])
-        txt = mx.array([[50258]]) if any_lang else mx.array([[50258, 50259, 50360, 50365]])
+    def __call__(self, path_audio, any_lang, quick):
+        raw = log_mel_spectrogram(path_audio)
+        sot = mx.array([[50258]]) if any_lang else mx.array([[50258, 50259, 50360]])
+        txt = self.parallel(raw, sot) if quick else self.recurrent(raw, sot)
+        return txt
+    def recurrent(self, raw, sot):
+        new_tok, i = mx.zeros((1,0)), 0
+        while i+3000 < len(raw):
+            piece = self.step(raw[i:i+3000][None], sot)
+            arg_hop = mx.argmax(piece).item()
+            hop = (piece[:,arg_hop].astype(mx.int32).item()-50365)*2
+            new_tok = mx.concatenate([new_tok, piece[:,:arg_hop]], axis=-1)
+            i += hop if hop > 0 else 3000
+        new_tok = [i for i in new_tok.astype(mx.int32).tolist()[0] if i < 50257]
+        return self.tokenizer.decode(new_tok)[0]
+    def parallel(self, raw, sot): # quick but choppy (to feed slms to get tldrs or fill in the holes)
+        raw = raw[:(raw.shape[0]//3000)*3000].reshape(-1, 3000, 128)
+        sot = mx.repeat(sot, raw.shape[0], 0)
+        new_tok = self.step(raw, sot)
+        arg_hop = mx.argmax(new_tok, axis=-1).tolist()
+        new_tok = [i[:a] for i,a in zip(new_tok.astype(mx.int32).tolist(),arg_hop)]
+        new_tok = [i for i in sum(new_tok, []) if i < 50257]
+        return self.tokenizer.decode(new_tok)[0]
+    def step(self, mel, txt):
+        mel = self.model.encode(mel)
         kv_cache = None
-        num_eot = txt.shape[0]
-        new_tok = mx.zeros((txt.shape[0],0))
-        for i in range(100):
+        B = mel.shape[0]
+        new_tok = mx.zeros((B,0), dtype=mx.int32)
+        goon = mx.ones((B,1), dtype=mx.bool_)
+        for i in range(446):
             logits, kv_cache, _ = self.model.decode(txt=txt, mel=mel, kv_cache=kv_cache)
-            txt = mx.argmax(logits[:,-1,:], axis=-1)[:,None]
+            txt = mx.argmax(logits[:,-1,:], axis=-1, keepdims=True)
             mx.eval(txt)
             new_tok = mx.concatenate([new_tok, txt], axis=-1)
-            num_eot -= (txt == 50257).sum()
-            if num_eot <= 0:
+            goon *= (txt != 50257)
+            if goon.sum() <= 0:
                 break
-        new_tok = new_tok.astype(mx.int32).tolist()
-        new_txt = self.tokenizer.decode(new_tok)
-        print(f'{new_tok=}\n{new_txt=}')
-        return new_tok, new_txt
+        return new_tok
 
-def transcribe(path_audio='test.wav', any_lang=False):
+def transcribe(path_audio=None, any_lang=False, quick=False):
+    if path_audio is None:
+        path_audio = hf_hub_download(repo_id='JosefAlbers/exurb1a', filename='1_alive.mp3')
     path_hf = snapshot_download(repo_id='openai/whisper-large-v3-turbo', allow_patterns=["config.json", "model.safetensors"])
     with open(f'{path_hf}/config.json', 'r') as fp:
         cfg = json.load(fp)
@@ -243,16 +261,10 @@ def transcribe(path_audio='test.wav', any_lang=False):
     model.load_weights(weights, strict=False)
     model.eval()
     mx.eval(model)
-    return model(path_audio=path_audio, any_lang=any_lang)
+    return model(path_audio=path_audio, any_lang=any_lang, quick=quick)
 
 def fire_main():
     fire.Fire(transcribe)
 
 if __name__ == '__main__':
     fire.Fire(transcribe)
-
-"""
-python test_hf.py  18.86s user 16.17s system 496% cpu 7.055 total
-python test_mlx.py  1.49s user 2.41s system 145% cpu 2.674 total
-python test_mine.py  0.34s user 0.58s system 66% cpu 1.391 total
-"""
