@@ -213,11 +213,11 @@ class Transcriber(nn.Module):
         self.tokenizer = Tokenizer()
     def __call__(self, path_audio, any_lang, quick):
         raw = log_mel_spectrogram(path_audio)
-        sot = mx.array([[50258]]) if any_lang else mx.array([[50258, 50259, 50360]])
+        sot = mx.array([[50258, 50360, 50365]]) if any_lang else mx.array([[50258, 50259, 50360, 50365]])
         txt = self.parallel(raw, sot) if quick else self.recurrent(raw, sot)
         return txt
     def recurrent(self, raw, sot):
-        new_tok, i = mx.zeros((1,0)), 0
+        new_tok, i = mx.zeros((1,0), dtype=mx.int32), 0
         while i+3000 < len(raw):
             piece = self.step(raw[i:i+3000][None], sot)
             arg_hop = mx.argmax(piece).item()
@@ -226,7 +226,7 @@ class Transcriber(nn.Module):
             i += hop if hop > 0 else 3000
         new_tok = [i for i in new_tok.astype(mx.int32).tolist()[0] if i < 50257]
         return self.tokenizer.decode(new_tok)[0]
-    def parallel(self, raw, sot): # quick but choppy (to feed slms to get tldrs or fill in the holes)
+    def parallel(self, raw, sot):
         raw = raw[:(raw.shape[0]//3000)*3000].reshape(-1, 3000, 128)
         sot = mx.repeat(sot, raw.shape[0], 0)
         new_tok = self.step(raw, sot)
@@ -240,7 +240,7 @@ class Transcriber(nn.Module):
         B = mel.shape[0]
         new_tok = mx.zeros((B,0), dtype=mx.int32)
         goon = mx.ones((B,1), dtype=mx.bool_)
-        for i in range(446):
+        for i in range(445):
             logits, kv_cache, _ = self.model.decode(txt=txt, mel=mel, kv_cache=kv_cache)
             txt = mx.argmax(logits[:,-1,:], axis=-1, keepdims=True)
             mx.eval(txt)
@@ -268,3 +268,8 @@ def fire_main():
 
 if __name__ == '__main__':
     fire.Fire(transcribe)
+
+    # for path_audio in ['0_test.wav', None]:
+    #     for any_lang in [True, False]:
+    #         for quick in [True, False]:
+    #             print(transcribe(path_audio=path_audio, any_lang=any_lang, quick=quick))
