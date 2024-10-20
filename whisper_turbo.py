@@ -176,7 +176,7 @@ class AudioEncoder(nn.Module):
         for block in self.layers:
             x, _, _ = block(x)
         x = self.layer_norm(x)
-        return x.astype(mx.float16)
+        return x
 
 class TextDecoder(nn.Module):
     def __init__(self, cfg):
@@ -214,7 +214,7 @@ class Transcriber(nn.Module):
         self.tokenizer = Tokenizer()
         self.len_sot = 0
     def __call__(self, path_audio, any_lang, quick):
-        raw = log_mel_spectrogram(path_audio)
+        raw = log_mel_spectrogram(path_audio).astype(mx.float16)
         sot = mx.array([[50258, 50360, 50365]]) if any_lang else mx.array([[50258, 50259, 50360, 50365]])
         self.len_sot = sot.shape[-1]
         txt = self.parallel(raw, sot) if quick else self.recurrent(raw, sot)
@@ -231,6 +231,7 @@ class Transcriber(nn.Module):
         return self.tokenizer.decode(new_tok)[0]
     def parallel(self, raw, sot):
         raw = raw[:(raw.shape[0]//3000)*3000].reshape(-1, 3000, 128)
+        assert raw.shape[0] < 360
         sot = mx.repeat(sot, raw.shape[0], 0)
         new_tok = self.step(raw, sot)
         arg_hop = mx.argmax(new_tok, axis=-1).tolist()
@@ -287,23 +288,24 @@ def fire_main():
 if __name__ == '__main__':
     fire.Fire(transcribe)
 
-# 0_test.mp3 any_lang=True quick=True:    1.32
-# 0_test.mp3 any_lang=True quick=False:   0.90
-# 0_test.mp3 any_lang=False quick=True:   0.86
-# 0_test.mp3 any_lang=False quick=False:  0.87
-# 1_alive.mp3 any_lang=True quick=True:   7.76
-# 1_alive.mp3 any_lang=True quick=False:  9.83
-# 1_alive.mp3 any_lang=False quick=True:  7.37
-# 1_alive.mp3 any_lang=False quick=False: 9.84
-# 2_make.mp3 any_lang=True quick=True:    8.02
-# 2_make.mp3 any_lang=True quick=False:   12.81
-# 2_make.mp3 any_lang=False quick=True:   7.33
-# 2_make.mp3 any_lang=False quick=False:  12.80
-# 3_try.mp3 any_lang=True quick=True:     10.19
-# 3_try.mp3 any_lang=True quick=False:    17.20
-# 3_try.mp3 any_lang=False quick=True:    9.06
-# 3_try.mp3 any_lang=False quick=False:   16.59
-# 4_never.mp3 any_lang=True quick=True:   14.74
-# 4_never.mp3 any_lang=True quick=False:  20.54
-# 4_never.mp3 any_lang=False quick=True:  12.70
-# 4_never.mp3 any_lang=False quick=False: 21.04
+# benchmarks:
+# 0_test.mp3 any_lang=True quick=True:    0.85
+# 0_test.mp3 any_lang=True quick=False:   0.75
+# 0_test.mp3 any_lang=False quick=True:   0.78
+# 0_test.mp3 any_lang=False quick=False:  0.77
+# 1_alive.mp3 any_lang=True quick=True:   7.10
+# 1_alive.mp3 any_lang=True quick=False:  7.98
+# 1_alive.mp3 any_lang=False quick=True:  6.57
+# 1_alive.mp3 any_lang=False quick=False: 7.98
+# 2_make.mp3 any_lang=True quick=True:    7.30
+# 2_make.mp3 any_lang=True quick=False:   13.30
+# 2_make.mp3 any_lang=False quick=True:   6.26
+# 2_make.mp3 any_lang=False quick=False:  11.10
+# 3_try.mp3 any_lang=True quick=True:     8.62
+# 3_try.mp3 any_lang=True quick=False:    14.79
+# 3_try.mp3 any_lang=False quick=True:    7.87
+# 3_try.mp3 any_lang=False quick=False:   15.21
+# 4_never.mp3 any_lang=True quick=True:   11.70
+# 4_never.mp3 any_lang=True quick=False:  17.70
+# 4_never.mp3 any_lang=False quick=True:  10.67
+# 4_never.mp3 any_lang=False quick=False: 19.48
