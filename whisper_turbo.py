@@ -1,19 +1,19 @@
 import base64
+import glob
 import json
 import math
 import os
+import time
 from functools import lru_cache
 from subprocess import CalledProcessError, run
 
 import fire
+import librosa
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import tiktoken
-from huggingface_hub import snapshot_download, hf_hub_download
-import librosa
-
-N_FFT = 400
+from huggingface_hub import hf_hub_download, snapshot_download
 
 class Tokenizer:
     def __init__(self):
@@ -46,13 +46,14 @@ def load_audio(file, sr=16000):
 def mel_filters(n_mels):
     path_mel = "mel_filters.npz"
     if not os.path.exists(path_mel):
-        np.savez_compressed(path_mel, mel_128=librosa.filters.mel(sr=16000, n_fft=N_FFT, n_mels=128))
+        np.savez_compressed(path_mel, mel_128=librosa.filters.mel(sr=16000, n_fft=400, n_mels=128))
     return mx.load(path_mel)[f"mel_{n_mels}"]
 
 @lru_cache(maxsize=None)
-def hanning():
-    return mx.array(np.hanning(N_FFT + 1)[:-1])
+def hanning(n_fft):
+    return mx.array(np.hanning(n_fft + 1)[:-1])
 
+@lru_cache(maxsize=None)
 def stft(x, window, nperseg=400, noverlap=160, nfft=None, axis=-1, pad_mode="reflect"):
     if nfft is None:
         nfft = nperseg
@@ -75,6 +76,7 @@ def stft(x, window, nperseg=400, noverlap=160, nfft=None, axis=-1, pad_mode="ref
     x = mx.as_strided(x, shape=shape, strides=strides)
     return mx.fft.rfft(x * window)
 
+@lru_cache(maxsize=None)
 def log_mel_spectrogram(audio, n_mels=128, padding=480000):
     if isinstance(audio, str):
         audio = load_audio(audio)
@@ -82,8 +84,8 @@ def log_mel_spectrogram(audio, n_mels=128, padding=480000):
         audio = mx.array(audio)
     if padding > 0:
         audio = mx.pad(audio, (0, padding))
-    window = hanning()
-    freqs = stft(audio, window, nperseg=N_FFT, noverlap=160)
+    window = hanning(400)
+    freqs = stft(audio, window, nperseg=400, noverlap=160)
     magnitudes = freqs[:-1, :].abs().square()
     filters = mel_filters(n_mels)
     mel_spec = magnitudes @ filters.T
@@ -132,8 +134,7 @@ class MultiHeadAttention(nn.Module):
         qk = q @ k
         if mask is not None:
             qk = qk + mask[:n_ctx, :n_ctx]
-        qk = qk.astype(mx.float32)
-        w = mx.softmax(qk, axis=-1).astype(q.dtype)
+        w = mx.softmax(qk, axis=-1)
         out = (w @ v).transpose(0, 2, 1, 3)
         out = out.reshape(n_batch, n_ctx, n_state)
         return out, qk
@@ -175,7 +176,7 @@ class AudioEncoder(nn.Module):
         for block in self.layers:
             x, _, _ = block(x)
         x = self.layer_norm(x)
-        return x
+        return x.astype(mx.float16)
 
 class TextDecoder(nn.Module):
     def __init__(self, cfg):
@@ -211,9 +212,11 @@ class Transcriber(nn.Module):
     def __init__(self, cfg):
         self.model = Whisper(cfg)
         self.tokenizer = Tokenizer()
+        self.len_sot = 0
     def __call__(self, path_audio, any_lang, quick):
         raw = log_mel_spectrogram(path_audio)
         sot = mx.array([[50258, 50360, 50365]]) if any_lang else mx.array([[50258, 50259, 50360, 50365]])
+        self.len_sot = sot.shape[-1]
         txt = self.parallel(raw, sot) if quick else self.recurrent(raw, sot)
         return txt
     def recurrent(self, raw, sot):
@@ -240,19 +243,19 @@ class Transcriber(nn.Module):
         B = mel.shape[0]
         new_tok = mx.zeros((B,0), dtype=mx.int32)
         goon = mx.ones((B,1), dtype=mx.bool_)
-        for i in range(445):
+        for i in range(449-self.len_sot):
             logits, kv_cache, _ = self.model.decode(txt=txt, mel=mel, kv_cache=kv_cache)
-            txt = mx.argmax(logits[:,-1,:], axis=-1, keepdims=True)
+            txt = mx.argmax(logits[:,-1,:], axis=-1, keepdims=True) * goon
             mx.eval(txt)
-            new_tok = mx.concatenate([new_tok, txt], axis=-1)
             goon *= (txt != 50257)
+            new_tok = mx.concatenate([new_tok, txt], axis=-1)
             if goon.sum() <= 0:
                 break
         return new_tok
 
 def transcribe(path_audio=None, any_lang=False, quick=False):
     if path_audio is None:
-        path_audio = hf_hub_download(repo_id='JosefAlbers/exurb1a', filename='1_alive.mp3')
+        return benchmark()
     path_hf = snapshot_download(repo_id='openai/whisper-large-v3-turbo', allow_patterns=["config.json", "model.safetensors"])
     with open(f'{path_hf}/config.json', 'r') as fp:
         cfg = json.load(fp)
@@ -263,13 +266,44 @@ def transcribe(path_audio=None, any_lang=False, quick=False):
     mx.eval(model)
     return model(path_audio=path_audio, any_lang=any_lang, quick=quick)
 
+def benchmark():
+    path_hf = snapshot_download(repo_id='JosefAlbers/exurb1a', allow_patterns=["*.mp3"])
+    tics = {}
+    for path_audio in sorted(glob.glob(f"{path_hf}/*.mp3")):
+        for any_lang in [True, False]:
+            for quick in [True, False]:
+                tic = time.perf_counter()
+                arg = f'{path_audio.split('/')[-1]} {any_lang=} {quick=}'
+                print(f'--- {arg=}')
+                print(transcribe(path_audio=path_audio, any_lang=any_lang, quick=quick))
+                tic = f'{(time.perf_counter() - tic):.2f}'
+                print(f'{tic=}')
+                tics[arg] = tic
+    return tics
+
 def fire_main():
     fire.Fire(transcribe)
 
 if __name__ == '__main__':
     fire.Fire(transcribe)
 
-    # for path_audio in ['0_test.wav', None]:
-    #     for any_lang in [True, False]:
-    #         for quick in [True, False]:
-    #             print(transcribe(path_audio=path_audio, any_lang=any_lang, quick=quick))
+# 0_test.mp3 any_lang=True quick=True:    1.32
+# 0_test.mp3 any_lang=True quick=False:   0.90
+# 0_test.mp3 any_lang=False quick=True:   0.86
+# 0_test.mp3 any_lang=False quick=False:  0.87
+# 1_alive.mp3 any_lang=True quick=True:   7.76
+# 1_alive.mp3 any_lang=True quick=False:  9.83
+# 1_alive.mp3 any_lang=False quick=True:  7.37
+# 1_alive.mp3 any_lang=False quick=False: 9.84
+# 2_make.mp3 any_lang=True quick=True:    8.02
+# 2_make.mp3 any_lang=True quick=False:   12.81
+# 2_make.mp3 any_lang=False quick=True:   7.33
+# 2_make.mp3 any_lang=False quick=False:  12.80
+# 3_try.mp3 any_lang=True quick=True:     10.19
+# 3_try.mp3 any_lang=True quick=False:    17.20
+# 3_try.mp3 any_lang=False quick=True:    9.06
+# 3_try.mp3 any_lang=False quick=False:   16.59
+# 4_never.mp3 any_lang=True quick=True:   14.74
+# 4_never.mp3 any_lang=True quick=False:  20.54
+# 4_never.mp3 any_lang=False quick=True:  12.70
+# 4_never.mp3 any_lang=False quick=False: 21.04
